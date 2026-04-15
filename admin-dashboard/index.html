@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agrich Admin Dashboard</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <!-- Login Screen -->
+    <div id="loginScreen" class="screen">
+        <div class="login-container">
+            <div class="login-card">
+                <h1>🌾 Agrich Admin</h1>
+                <p class="subtitle">Administrative Dashboard</p>
+                
+                <form id="loginForm">
+                    <div class="form-group">
+                        <label>Email</label>
+                        <input type="email" id="adminEmail" placeholder="admin@agrich.com" required>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Password</label>
+                        <input type="password" id="adminPassword" placeholder="Enter password" required>
+                    </div>
+                    
+                    <button type="submit" class="btn-primary">Login</button>
+                    
+                    <div id="loginError" class="error-message"></div>
+                </form>
+                
+                <p class="help-text">Default: admin@agrich.com / admin123</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Dashboard Screen -->
+    <div id="dashboardScreen" class="screen hidden">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-content">
+                <h1>🌾 Agrich Admin Dashboard</h1>
+                <div class="header-actions">
+                    <span id="adminName" class="admin-name"></span>
+                    <button onclick="logout()" class="btn-secondary">Logout</button>
+                </div>
+            </div>
+        </header>
+
+        <!-- Navigation -->
+        <nav class="nav-tabs">
+            <button class="nav-tab active" onclick="showTab('overview')">Overview</button>
+            <button class="nav-tab" onclick="showTab('approvals')">User Approvals</button>
+            <button class="nav-tab" onclick="showTab('transactions')">Pending Transactions</button>
+            <button class="nav-tab" onclick="showTab('mandi')">Market Prices</button>
+            <button class="nav-tab" onclick="showTab('kyc')">KYC Approval</button>
+            <button class="nav-tab" onclick="showTab('users')">Users</button>
+            <button class="nav-tab" onclick="showTab('tenders')">Tenders</button>
+        </nav>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Overview Tab -->
+            <div id="overviewTab" class="tab-content active">
+                <h2>Platform Overview</h2>
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon">👥</div>
+                        <div class="stat-value" id="statTotalUsers">-</div>
+                        <div class="stat-label">Total Users</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">🛒</div>
+                        <div class="stat-value" id="statTotalBuyers">-</div>
+                        <div class="stat-label">Buyers</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">🏪</div>
+                        <div class="stat-value" id="statTotalSellers">-</div>
+                        <div class="stat-label">Sellers</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">📋</div>
+                        <div class="stat-value" id="statActiveTenders">-</div>
+                        <div class="stat-label">Active Tenders</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">🔨</div>
+                        <div class="stat-value" id="statActiveAuctions">-</div>
+                        <div class="stat-label">Active Auctions</div>
+                    </div>
+                    <div class="stat-card highlight">
+                        <div class="stat-icon">⏳</div>
+                        <div class="stat-value" id="statPendingKYC">-</div>
+                        <div class="stat-label">Pending KYC</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- KYC Approval Tab -->
+            <div id="kycTab" class="tab-content">
+                <h2>KYC Approval Queue</h2>
+                <div id="kycList" class="data-list"></div>
+            </div>
+
+            <!-- Mandi Prices Tab -->
+            <div id="mandiTab" class="tab-content">
+                <h2>Market Prices Management</h2>
+                
+                <!-- Add New Price Form -->
+                <div class="add-price-form">
+                    <h3>Add/Update Market Price</h3>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>State *</label>
+                            <select id="mandiState">
+                                <option value="">Select State</option>
+                                <option value="Punjab">Punjab</option>
+                                <option value="UP">Uttar Pradesh</option>
+                                <option value="Gujarat">Gujarat</option>
+                                <option value="MP">Madhya Pradesh</option>
+                                <option value="West Bengal">West Bengal</option>
+                                <option value="Bihar">Bihar</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>Mandi Name *</label>
+                            <input type="text" id="mandiName" placeholder="e.g., Jalandhar">
+                        </div>
+                        <div class="form-group">
+                            <label>Variety *</label>
+                            <select id="mandiVariety">
+                                <option value="">Select Variety</option>
+                                <option value="Chipsona UP">Chipsona UP</option>
+                                <option value="Chipsona MP">Chipsona MP</option>
+                                <option value="LR Gujarat">LR Gujarat</option>
+                                <option value="Kufri Jyoti">Kufri Jyoti</option>
+                                <option value="Local">Local</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>Price (₹/kg) *</label>
+                            <input type="number" id="mandiPrice" placeholder="e.g., 1850">
+                        </div>
+                        <button class="btn-primary" onclick="addMandiPrice()">Add/Update Price</button>
+                    </div>
+                </div>
+
+                <!-- Price List -->
+                <div id="mandiPricesList" class="data-list"></div>
+            </div>
+
+            <!-- Users Tab -->
+            <div id="usersTab" class="tab-content">
+                <h2>User Management</h2>
+                <div id="usersList" class="data-list"></div>
+            </div>
+
+            <!-- Pending Transactions Tab -->
+            <div id="transactionsTab" class="tab-content">
+                <h2>Pending Transactions (Quality Check)</h2>
+                <p class="tab-description">Review and approve/reject seller acceptances awaiting quality verification.</p>
+                <div id="transactionsList" class="data-list"></div>
+            </div>
+
+            <!-- User Approvals Tab -->
+            <div id="approvalsTab" class="tab-content">
+                <h2>Pending User Approvals</h2>
+                <p class="tab-description">Review and approve new user registrations. Users cannot login until approved.</p>
+                <div id="approvalsList" class="data-list"></div>
+            </div>
+
+            <!-- Tenders Tab -->
+            <div id="tendersTab" class="tab-content">
+                <h2>All Tenders</h2>
+                <div id="tendersList" class="data-list"></div>
+            </div>
+
+            <!-- Auctions Tab -->
+            <div id="auctionsTab" class="tab-content">
+                <h2>All Auctions</h2>
+                <div id="auctionsList" class="data-list"></div>
+            </div>
+        </main>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

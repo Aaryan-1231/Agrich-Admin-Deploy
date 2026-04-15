@@ -1,0 +1,1087 @@
+from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+import os
+import logging
+from pathlib import Path
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any
+from datetime import datetime, timedelta
+from bson import ObjectId
+import json
+import httpx
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+# MongoDB connection
+mongo_url = os.environ['MONGO_URL']
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ['DB_NAME']]
+
+# Create the main app
+app = FastAPI()
+api_router = APIRouter(prefix="/api")
+
+# WebSocket connection manager for real-time bidding
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, List[WebSocket]] = {}
+
+    async def connect(self, websocket: WebSocket, auction_id: str):
+        await websocket.accept()
+        if auction_id not in self.active_connections:
+            self.active_connections[auction_id] = []
+        self.active_connections[auction_id].append(websocket)
+
+    def disconnect(self, websocket: WebSocket, auction_id: str):
+        if auction_id in self.active_connections:
+            self.active_connections[auction_id].remove(websocket)
+
+    async def broadcast(self, auction_id: str, message: dict):
+        if auction_id in self.active_connections:
+            for connection in self.active_connections[auction_id]:
+                try:
+                    await connection.send_json(message)
+                except:
+                    pass
+
+manager = ConnectionManager()
+
+# Helper function to serialize MongoDB documents
+def serialize_doc(doc):
+    if doc is None:
+        return None
+    if isinstance(doc, list):
+        return [serialize_doc(item) for item in doc]
+    if isinstance(doc, dict):
+        doc = doc.copy()
+        if '_id' in doc:
+            doc['_id'] = str(doc['_id'])
+        return {k: serialize_doc(v) for k, v in doc.items()}
+    if isinstance(doc, ObjectId):
+        return str(doc)
+    if isinstance(doc, datetime):
+        return doc.isoformat()
+    return doc
+
+# ==================== MODELS ====================
+
+# Auth Models
+class SendOTPRequest(BaseModel):
+    phone: str
+
+class VerifyOTPRequest(BaseModel):
+    phone: str
+    otp: str
+    firebase_uid: Optional[str] = None  # Firebase UID if using Firebase Auth
+
+class AuthResponse(BaseModel):
+    token: str
+    user: Dict[str, Any]
+
+# User Models
+class UserCreate(BaseModel):
+    phone: str
+    company_name: str
+    business_type: str  # "buyer", "seller", "both"
+    location: str
+    address: str
+    firebase_uid: Optional[str] = None  # Firebase UID if using Firebase Auth
+
+class KYCUpload(BaseModel):
+    user_id: str
+    gst_document: str  # base64
+    pan_document: str  # base64
+    storage_location: Optional[str] = None
+
+# Tender Models (Reverse Auction - Buyer creates, Seller bids, Lowest wins)
+class TenderCreate(BaseModel):
+    variety: str
+    size: str  # "35+", "40+", "45+", "55+"
+    quantity_mt: float
+    buyer_rate: float  # Buyer's fixed rate per kg
+    delivery_location: str
+    delivery_date_from: str
+    delivery_date_to: str
+    notes: Optional[str] = None
+
+class TenderBid(BaseModel):
+    tender_id: str
+    rate_per_kg: float
+    inward_challan: Optional[str] = None  # base64
+    delivery_timeline: str
+    quantity_accepted: Optional[float] = None  # Seller can accept partial quantity
+
+# Auction Models (Forward Auction - Seller creates, Buyer bids, Highest wins)
+class AuctionCreate(BaseModel):
+    variety: str
+    size: str
+    quantity_mt: float
+    storage_location: str
+    base_price: float
+    lot_photos: Optional[List[str]] = None  # base64 images
+    quality_notes: Optional[str] = None
+
+class AuctionBid(BaseModel):
+    auction_id: str
+    bid_amount: float
+
+# Rating Model
+class RatingCreate(BaseModel):
+    contract_id: str
+    rated_user_id: str
+    rating: int  # 1-5
+    timely_payment: int
+    quality_match: int
+    delivery_compliance: int
+    professionalism: int
+    comment: Optional[str] = None
+
+# Admin Models
+class AdminLogin(BaseModel):
+    email: str
+    password: str
+
+class KYCApproval(BaseModel):
+    user_id: str
+    status: str  # "approved" or "rejected"
+    notes: Optional[str] = None
+
+class UserSuspension(BaseModel):
+    user_id: str
+    suspended: bool
+    reason: Optional[str] = None
+
+# Transport Partner Model
+class TransportPartner(BaseModel):
+    name: str
+    routes: List[str]
+    rate_per_km: float
+    rating: float
+    contact: str
+
+# Push Notification Models
+class PushTokenRegister(BaseModel):
+    user_id: str
+    push_token: str
+    platform: str  # "ios" or "android" or "web"
+
+# Push Notification Helper Functions
+async def send_push_notification(push_token: str, title: str, body: str, data: dict = None):
+    """Send a push notification via Expo Push Service"""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://exp.host/--/api/v2/push/send",
+                json={
+                    "to": push_token,
+                    "sound": "default",
+                    "title": title,
+                    "body": body,
+                    "data": data or {}
+                },
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json"
+                },
+                timeout=10.0
+            )
+            result = response.json()
+            logging.info(f"Push notification sent: {result}")
+            return result
+    except Exception as e:
+        logging.error(f"Failed to send push notification: {e}")
+        return None
+
+async def send_notification_to_user(user_id: str, title: str, body: str, data: dict = None):
+    """Send notification to a specific user"""
+    user_token = await db.push_tokens.find_one({"user_id": user_id})
+    if user_token and user_token.get("push_token"):
+        return await send_push_notification(user_token["push_token"], title, body, data)
+    return None
+
+async def send_notification_to_all_sellers(title: str, body: str, data: dict = None):
+    """Send notification to all approved sellers"""
+    sellers = await db.users.find({
+        "business_type": "seller",
+        "approved": True
+    }).to_list(1000)
+    
+    for seller in sellers:
+        await send_notification_to_user(str(seller["_id"]), title, body, data)
+
+async def send_notification_to_all_buyers(title: str, body: str, data: dict = None):
+    """Send notification to all approved buyers"""
+    buyers = await db.users.find({
+        "business_type": "buyer",
+        "approved": True
+    }).to_list(1000)
+    
+    for buyer in buyers:
+        await send_notification_to_user(str(buyer["_id"]), title, body, data)
+
+# ==================== AUTH ENDPOINTS ====================
+
+@api_router.post("/auth/send-otp")
+async def send_otp(request: SendOTPRequest):
+    """Mock OTP - In production, integrate with Firebase"""
+    # For MVP, we just return success. Any 6-digit code will work in verify
+    return {"success": True, "message": "OTP sent successfully"}
+
+@api_router.post("/auth/verify-otp")
+async def verify_otp(request: VerifyOTPRequest):
+    """Mock OTP verification - any 6-digit code works (or Firebase verified)"""
+    if len(request.otp) != 6:
+        raise HTTPException(status_code=400, detail="Invalid OTP")
+    
+    # Check if user exists
+    user = await db.users.find_one({"phone": request.phone})
+    
+    if not user:
+        # New user - return flag to complete registration
+        return {
+            "success": True,
+            "new_user": True,
+            "phone": request.phone
+        }
+    
+    # If Firebase UID is provided, update the user record
+    if request.firebase_uid:
+        await db.users.update_one(
+            {"_id": user["_id"]},
+            {"$set": {"firebase_uid": request.firebase_uid}}
+        )
+    
+    # Check if user is approved by admin
+    if not user.get("approved", False):
+        return {
+            "success": False,
+            "pending_approval": True,
+            "message": "Your account is pending admin approval. Please wait for approval."
+        }
+    
+    # Existing user - return token and user data
+    token = f"mock_token_{request.phone}"
+    return {
+        "success": True,
+        "new_user": False,
+        "token": token,
+        "user": serialize_doc(user)
+    }
+
+@api_router.post("/auth/register")
+async def register_user(user_data: UserCreate):
+    """Complete user registration"""
+    existing = await db.users.find_one({"phone": user_data.phone})
+    if existing:
+        raise HTTPException(status_code=400, detail="User already exists")
+    
+    user_dict = {
+        **user_data.dict(),
+        "kyc_status": "pending",
+        "verified": False,
+        "approved": False,  # Users need admin approval to login
+        "rating": 0,
+        "total_trades": 0,
+        "created_at": datetime.utcnow()
+    }
+    
+    result = await db.users.insert_one(user_dict)
+    user_dict['_id'] = str(result.inserted_id)
+    
+    return {
+        "success": True,
+        "pending_approval": True,
+        "message": "Registration successful! Your account is pending admin approval. You will be able to login once approved."
+    }
+
+# ==================== PUSH NOTIFICATION ENDPOINTS ====================
+
+@api_router.post("/notifications/register-token")
+async def register_push_token(token_data: PushTokenRegister):
+    """Register or update a user's push notification token"""
+    # Upsert the token - update if exists, insert if not
+    await db.push_tokens.update_one(
+        {"user_id": token_data.user_id},
+        {
+            "$set": {
+                "push_token": token_data.push_token,
+                "platform": token_data.platform,
+                "updated_at": datetime.utcnow()
+            }
+        },
+        upsert=True
+    )
+    return {"success": True, "message": "Push token registered successfully"}
+
+@api_router.delete("/notifications/unregister-token")
+async def unregister_push_token(user_id: str):
+    """Remove a user's push notification token (e.g., on logout)"""
+    await db.push_tokens.delete_one({"user_id": user_id})
+    return {"success": True, "message": "Push token removed successfully"}
+
+# ==================== KYC ENDPOINTS ====================
+
+@api_router.post("/kyc/upload")
+async def upload_kyc(kyc_data: KYCUpload):
+    """Upload KYC documents"""
+    kyc_dict = {
+        **kyc_data.dict(),
+        "status": "pending",
+        "uploaded_at": datetime.utcnow()
+    }
+    
+    await db.kyc_documents.insert_one(kyc_dict)
+    await db.users.update_one(
+        {"_id": ObjectId(kyc_data.user_id)},
+        {"$set": {"kyc_status": "submitted"}}
+    )
+    
+    return {"success": True, "message": "KYC documents uploaded successfully"}
+
+@api_router.get("/kyc/status/{user_id}")
+async def get_kyc_status(user_id: str):
+    """Get KYC status for a user"""
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return {"kyc_status": user.get("kyc_status", "pending")}
+
+# ==================== TENDER ENDPOINTS (Reverse Auction) ====================
+
+@api_router.post("/tenders/create")
+async def create_tender(tender_data: TenderCreate, user_id: str):
+    """Buyer creates a reverse tender with fixed 24-hour deadline"""
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    if user.get("business_type") != "buyer":
+        raise HTTPException(status_code=403, detail="Only buyers can create tenders")
+    
+    # Fixed 24-hour deadline
+    tender_dict = {
+        **tender_data.dict(),
+        "buyer_id": user_id,
+        "buyer_name": user["company_name"],
+        "status": "active",
+        "bids": [],
+        "created_at": datetime.utcnow(),
+        "ends_at": datetime.utcnow() + timedelta(hours=24)
+    }
+    
+    result = await db.tenders.insert_one(tender_dict)
+    tender_dict['_id'] = str(result.inserted_id)
+    
+    # Send push notification to all approved sellers about new tender
+    await send_notification_to_all_sellers(
+        title="New Tender Available!",
+        body=f"{tender_data.variety} - {tender_data.quantity_mt} MT @ ₹{tender_data.buyer_rate}/kg",
+        data={
+            "type": "new_tender",
+            "tender_id": str(result.inserted_id),
+            "variety": tender_data.variety,
+            "quantity": tender_data.quantity_mt,
+            "rate": tender_data.buyer_rate
+        }
+    )
+    
+    return {"success": True, "tender": serialize_doc(tender_dict)}
+
+@api_router.get("/tenders/active")
+async def get_active_tenders(user_id: Optional[str] = None):
+    """Get active tenders - Buyers see only their own, Sellers see all"""
+    query = {
+        "status": "active",
+        "ends_at": {"$gt": datetime.utcnow()}
+    }
+    
+    # If user_id provided, check if buyer and filter to their own tenders
+    if user_id:
+        try:
+            user = await db.users.find_one({"_id": ObjectId(user_id)})
+            if user and user.get("business_type") == "buyer":
+                # Buyers only see their own tenders
+                query["buyer_id"] = user_id
+        except:
+            pass
+    
+    tenders = await db.tenders.find(query).to_list(100)
+    
+    return {"tenders": serialize_doc(tenders)}
+
+@api_router.get("/tenders/{tender_id}")
+async def get_tender(tender_id: str):
+    """Get tender details with all bids"""
+    tender = await db.tenders.find_one({"_id": ObjectId(tender_id)})
+    if not tender:
+        raise HTTPException(status_code=404, detail="Tender not found")
+    
+    return {"tender": serialize_doc(tender)}
+
+@api_router.post("/tenders/bid")
+async def place_tender_bid(bid_data: TenderBid, user_id: str):
+    """Seller accepts order (with quality check pending)"""
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    if user.get("business_type") != "seller":
+        raise HTTPException(status_code=403, detail="Only sellers can accept orders")
+    
+    tender = await db.tenders.find_one({"_id": ObjectId(bid_data.tender_id)})
+    if not tender:
+        raise HTTPException(status_code=404, detail="Tender not found")
+    
+    if tender["ends_at"] < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="Tender has ended")
+    
+    # Calculate total already accepted quantity from all sellers (only non-rejected bids)
+    total_accepted = 0
+    for existing_bid in tender.get("bids", []):
+        if existing_bid.get("status") != "rejected":
+            total_accepted += existing_bid.get("quantity_accepted", 0)
+    
+    remaining_quantity = tender["quantity_mt"] - total_accepted
+    
+    if remaining_quantity <= 0:
+        raise HTTPException(status_code=400, detail="This tender has been fully accepted. No more quantity available.")
+    
+    # Validate quantity doesn't exceed remaining
+    quantity_to_accept = bid_data.quantity_accepted or remaining_quantity
+    if quantity_to_accept > remaining_quantity:
+        raise HTTPException(status_code=400, detail=f"Only {remaining_quantity} MT remaining. Cannot accept {quantity_to_accept} MT.")
+    
+    if quantity_to_accept <= 0:
+        raise HTTPException(status_code=400, detail="Quantity must be greater than 0")
+    
+    bid = {
+        "bidder_id": user_id,
+        "bidder_name": user["company_name"],
+        "rate_per_kg": bid_data.rate_per_kg,
+        "quantity_accepted": quantity_to_accept,
+        "delivery_timeline": bid_data.delivery_timeline,
+        "bid_time": datetime.utcnow(),
+        "status": "quality_check",  # Pending admin approval
+        "admin_notes": None
+    }
+    
+    await db.tenders.update_one(
+        {"_id": ObjectId(bid_data.tender_id)},
+        {"$push": {"bids": bid}}
+    )
+    
+    # Broadcast to all connected clients
+    await manager.broadcast(bid_data.tender_id, {
+        "type": "new_bid",
+        "tender_id": bid_data.tender_id,
+        "bid": serialize_doc(bid)
+    })
+    
+    # Send push notification to the buyer that their order was accepted
+    await send_notification_to_user(
+        user_id=tender["buyer_id"],
+        title="Order Accepted!",
+        body=f"{user['company_name']} accepted {quantity_to_accept} MT of {tender['variety']} @ ₹{tender['buyer_rate']}/kg",
+        data={
+            "type": "order_accepted",
+            "tender_id": bid_data.tender_id,
+            "seller_name": user["company_name"],
+            "quantity": quantity_to_accept
+        }
+    )
+    
+    return {"success": True, "message": f"Order accepted for {quantity_to_accept} MT! Awaiting quality check approval."}
+
+# ==================== AUCTION ENDPOINTS (Forward Auction) ====================
+
+@api_router.post("/auctions/create")
+async def create_auction(auction_data: AuctionCreate, user_id: str):
+    """Seller creates a forward auction with fixed 24-hour deadline"""
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    if user.get("business_type") != "seller":
+        raise HTTPException(status_code=403, detail="Only sellers can create auctions")
+    
+    # Fixed 24-hour deadline
+    auction_dict = {
+        **auction_data.dict(),
+        "seller_id": user_id,
+        "seller_name": user["company_name"],
+        "status": "active",
+        "bids": [],
+        "created_at": datetime.utcnow(),
+        "ends_at": datetime.utcnow() + timedelta(hours=24)
+    }
+    
+    result = await db.auctions.insert_one(auction_dict)
+    auction_dict['_id'] = str(result.inserted_id)
+    
+    return {"success": True, "auction": serialize_doc(auction_dict)}
+
+@api_router.get("/auctions/active")
+async def get_active_auctions():
+    """Get all active auctions"""
+    auctions = await db.auctions.find({
+        "status": "active",
+        "ends_at": {"$gt": datetime.utcnow()}
+    }).to_list(100)
+    
+    return {"auctions": serialize_doc(auctions)}
+
+@api_router.get("/auctions/{auction_id}")
+async def get_auction(auction_id: str):
+    """Get auction details with all bids"""
+    auction = await db.auctions.find_one({"_id": ObjectId(auction_id)})
+    if not auction:
+        raise HTTPException(status_code=404, detail="Auction not found")
+    
+    return {"auction": serialize_doc(auction)}
+
+@api_router.post("/auctions/bid")
+async def place_auction_bid(bid_data: AuctionBid, user_id: str):
+    """Buyer places bid on auction (highest bid wins)"""
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    if user.get("business_type") != "buyer":
+        raise HTTPException(status_code=403, detail="Only buyers can bid on auctions")
+    
+    auction = await db.auctions.find_one({"_id": ObjectId(bid_data.auction_id)})
+    if not auction:
+        raise HTTPException(status_code=404, detail="Auction not found")
+    
+    if auction["ends_at"] < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="Auction has ended")
+    
+    # Ensure bid is higher than current highest
+    current_highest = auction.get("base_price", 0)
+    if auction.get("bids"):
+        current_highest = max([b["bid_amount"] for b in auction["bids"]])
+    
+    if bid_data.bid_amount <= current_highest:
+        raise HTTPException(status_code=400, detail="Bid must be higher than current highest bid")
+    
+    bid = {
+        "bidder_id": user_id,
+        "bidder_name": user["company_name"],
+        "bid_amount": bid_data.bid_amount,
+        "bid_time": datetime.utcnow()
+    }
+    
+    await db.auctions.update_one(
+        {"_id": ObjectId(bid_data.auction_id)},
+        {"$push": {"bids": bid}}
+    )
+    
+    # Broadcast to all connected clients
+    await manager.broadcast(bid_data.auction_id, {
+        "type": "new_bid",
+        "auction_id": bid_data.auction_id,
+        "bid": serialize_doc(bid)
+    })
+    
+    return {"success": True, "message": "Bid placed successfully"}
+
+# ==================== USER PROFILE & RATINGS ====================
+
+@api_router.get("/users/{user_id}/profile")
+async def get_user_profile(user_id: str):
+    """Get user public profile"""
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Get ratings
+    ratings = await db.ratings.find({"rated_user_id": user_id}).to_list(100)
+    
+    avg_rating = 0
+    if ratings:
+        avg_rating = sum([r["rating"] for r in ratings]) / len(ratings)
+    
+    return {
+        "profile": {
+            "company_name": user["company_name"],
+            "location": user["location"],
+            "business_type": user["business_type"],
+            "verified": user.get("verified", False),
+            "rating": round(avg_rating, 1),
+            "total_trades": user.get("total_trades", 0),
+            "member_since": user["created_at"].strftime("%B %Y")
+        }
+    }
+
+@api_router.post("/ratings/create")
+async def create_rating(rating_data: RatingCreate, user_id: str):
+    """Create rating after trade completion"""
+    rating_dict = {
+        **rating_data.dict(),
+        "rater_id": user_id,
+        "created_at": datetime.utcnow()
+    }
+    
+    await db.ratings.insert_one(rating_dict)
+    
+    return {"success": True, "message": "Rating submitted successfully"}
+
+@api_router.get("/user/transactions")
+async def get_user_transactions(user_id: str):
+    """Get user's active contracts and transaction history"""
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    is_buyer = user.get("business_type") == "buyer"
+    active_contracts = []
+    transaction_history = []
+    
+    if is_buyer:
+        # Buyer: Get their tenders with bids
+        tenders = await db.tenders.find({
+            "buyer_id": user_id,
+            "bids": {"$exists": True, "$ne": []}
+        }).to_list(100)
+        
+        for tender in tenders:
+            for bid in tender.get("bids", []):
+                contract_data = {
+                    "variety": tender.get("variety"),
+                    "size": tender.get("size"),
+                    "quantity": float(bid.get("quantity_accepted", 0)),
+                    "rate": float(tender.get("buyer_rate", 0)),
+                    "status": bid.get("status", "quality_check"),
+                    "counterparty_name": bid.get("bidder_name"),
+                    "delivery_location": tender.get("delivery_location"),
+                    "date": bid.get("bid_time")
+                }
+                
+                if bid.get("status") == "quality_check":
+                    active_contracts.append(contract_data)
+                else:
+                    transaction_history.append(contract_data)
+    else:
+        # Seller: Get all tenders they have bid on
+        all_tenders = await db.tenders.find({
+            "bids.bidder_id": user_id
+        }).to_list(100)
+        
+        for tender in all_tenders:
+            # Get buyer info
+            buyer = await db.users.find_one({"_id": ObjectId(tender["buyer_id"])})
+            buyer_name = buyer.get("company_name", "Unknown") if buyer else "Unknown"
+            
+            for bid in tender.get("bids", []):
+                if bid.get("bidder_id") == user_id:
+                    contract_data = {
+                        "variety": tender.get("variety"),
+                        "size": tender.get("size"),
+                        "quantity": float(bid.get("quantity_accepted", 0)),
+                        "rate": float(tender.get("buyer_rate", 0)),
+                        "status": bid.get("status", "quality_check"),
+                        "counterparty_name": buyer_name,
+                        "delivery_location": tender.get("delivery_location"),
+                        "date": bid.get("bid_time")
+                    }
+                    
+                    if bid.get("status") == "quality_check":
+                        active_contracts.append(contract_data)
+                    else:
+                        transaction_history.append(contract_data)
+    
+    # Sort by date (newest first)
+    active_contracts.sort(key=lambda x: x.get("date") or datetime.min, reverse=True)
+    transaction_history.sort(key=lambda x: x.get("date") or datetime.min, reverse=True)
+    
+    return {
+        "active_contracts": serialize_doc(active_contracts),
+        "transaction_history": serialize_doc(transaction_history)
+    }
+
+# ==================== MANDI PRICES ====================
+
+@api_router.get("/mandi/prices")
+async def get_mandi_prices(state: Optional[str] = None):
+    """Get mandi prices from database"""
+    query = {}
+    if state:
+        query["state"] = state
+    
+    prices = await db.mandi_prices.find(query).sort("updated_at", -1).to_list(100)
+    
+    # If no prices in DB, return empty list
+    if not prices:
+        return {"prices": []}
+    
+    return {"prices": serialize_doc(prices)}
+
+# ==================== TRANSPORT PARTNERS ====================
+
+@api_router.get("/transport/partners")
+async def get_transport_partners():
+    """Get list of transport partners"""
+    partners = await db.transport_partners.find().to_list(100)
+    return {"partners": serialize_doc(partners)}
+
+@api_router.post("/transport/estimate")
+async def estimate_freight(from_location: str, to_location: str):
+    """Estimate freight cost - mock calculation"""
+    # Mock calculation - in production, use actual distance API
+    base_distance = 500  # km
+    rate_per_km = 8  # rupees
+    
+    estimated_cost = base_distance * rate_per_km
+    
+    return {
+        "from": from_location,
+        "to": to_location,
+        "estimated_distance_km": base_distance,
+        "estimated_cost": estimated_cost,
+        "rate_per_km": rate_per_km
+    }
+
+# ==================== WEBSOCKET FOR REAL-TIME BIDDING ====================
+
+@app.websocket("/ws/{auction_id}")
+async def websocket_endpoint(websocket: WebSocket, auction_id: str):
+    await manager.connect(websocket, auction_id)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            # Keep connection alive
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, auction_id)
+
+# ==================== ADMIN ENDPOINTS ====================
+
+# Simple admin credentials (for MVP - should be in database in production)
+ADMIN_CREDENTIALS = {
+    "admin@agrich.com": "admin123"
+}
+
+@api_router.post("/admin/login")
+async def admin_login(credentials: AdminLogin):
+    """Admin login"""
+    if credentials.email in ADMIN_CREDENTIALS and ADMIN_CREDENTIALS[credentials.email] == credentials.password:
+        # In production, generate proper JWT token
+        token = f"admin_token_{credentials.email}"
+        return {
+            "success": True,
+            "token": token,
+            "admin": {"email": credentials.email, "role": "admin"}
+        }
+    raise HTTPException(status_code=401, detail="Invalid credentials")
+
+@api_router.get("/admin/dashboard/stats")
+async def get_dashboard_stats():
+    """Get platform statistics"""
+    total_users = await db.users.count_documents({})
+    total_buyers = await db.users.count_documents({"business_type": "buyer"})
+    total_sellers = await db.users.count_documents({"business_type": "seller"})
+    
+    active_tenders = await db.tenders.count_documents({
+        "status": "active",
+        "ends_at": {"$gt": datetime.utcnow()}
+    })
+    
+    active_auctions = await db.auctions.count_documents({
+        "status": "active",
+        "ends_at": {"$gt": datetime.utcnow()}
+    })
+    
+    pending_kyc = await db.users.count_documents({"kyc_status": {"$in": ["pending", "submitted"]}})
+    
+    return {
+        "total_users": total_users,
+        "total_buyers": total_buyers,
+        "total_sellers": total_sellers,
+        "active_tenders": active_tenders,
+        "active_auctions": active_auctions,
+        "pending_kyc": pending_kyc
+    }
+
+@api_router.get("/admin/users")
+async def get_all_users(skip: int = 0, limit: int = 50):
+    """Get all users for admin"""
+    users = await db.users.find().skip(skip).limit(limit).to_list(limit)
+    total = await db.users.count_documents({})
+    return {
+        "users": serialize_doc(users),
+        "total": total
+    }
+
+@api_router.get("/admin/kyc/pending")
+async def get_pending_kyc():
+    """Get all pending KYC submissions"""
+    users = await db.users.find({"kyc_status": {"$in": ["pending", "submitted"]}}).to_list(100)
+    
+    result = []
+    for user in users:
+        kyc_doc = await db.kyc_documents.find_one({"user_id": str(user["_id"])})
+        result.append({
+            "user": serialize_doc(user),
+            "kyc": serialize_doc(kyc_doc) if kyc_doc else None
+        })
+    
+    return {"pending_kyc": result}
+
+@api_router.post("/admin/kyc/approve")
+async def approve_kyc(approval: KYCApproval):
+    """Approve or reject KYC"""
+    await db.users.update_one(
+        {"_id": ObjectId(approval.user_id)},
+        {
+            "$set": {
+                "kyc_status": approval.status,
+                "verified": approval.status == "approved"
+            }
+        }
+    )
+    
+    await db.kyc_documents.update_one(
+        {"user_id": approval.user_id},
+        {"$set": {"status": approval.status, "admin_notes": approval.notes}}
+    )
+    
+    return {"success": True, "message": f"KYC {approval.status}"}
+
+@api_router.post("/admin/users/suspend")
+async def suspend_user(suspension: UserSuspension):
+    """Suspend or activate user"""
+    await db.users.update_one(
+        {"_id": ObjectId(suspension.user_id)},
+        {"$set": {"suspended": suspension.suspended, "suspension_reason": suspension.reason}}
+    )
+    
+    return {"success": True, "message": "User status updated"}
+
+@api_router.get("/admin/users/pending")
+async def get_pending_users():
+    """Get all users pending approval"""
+    users = await db.users.find({"approved": {"$ne": True}}).to_list(100)
+    return {"pending_users": serialize_doc(users)}
+
+@api_router.post("/admin/users/approve")
+async def approve_user(user_id: str, approved: bool = True):
+    """Approve or reject a user"""
+    result = await db.users.update_one(
+        {"_id": ObjectId(user_id)},
+        {"$set": {"approved": approved}}
+    )
+    
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    status = "approved" if approved else "rejected"
+    
+    # Send push notification to user about their approval status
+    if approved:
+        await send_notification_to_user(
+            user_id=user_id,
+            title="Account Approved!",
+            body="Your Agrich account has been approved. You can now start trading!",
+            data={"type": "account_approved"}
+        )
+    else:
+        await send_notification_to_user(
+            user_id=user_id,
+            title="Account Status Update",
+            body="Your Agrich account registration was not approved. Please contact support.",
+            data={"type": "account_rejected"}
+        )
+    
+    return {"success": True, "message": f"User {status} successfully"}
+
+@api_router.get("/admin/tenders/all")
+async def get_all_tenders_admin():
+    """Get all tenders for admin monitoring"""
+    tenders = await db.tenders.find().sort("created_at", -1).limit(100).to_list(100)
+    return {"tenders": serialize_doc(tenders)}
+
+@api_router.get("/admin/auctions/all")
+async def get_all_auctions_admin():
+    """Get all auctions for admin monitoring"""
+    auctions = await db.auctions.find().sort("created_at", -1).limit(100).to_list(100)
+    return {"auctions": serialize_doc(auctions)}
+
+@api_router.post("/admin/mandi/update")
+async def update_mandi_price(state: str, mandi: str, variety: str, price: float):
+    """Add or update mandi price"""
+    # Check if this mandi entry already exists
+    existing = await db.mandi_prices.find_one({
+        "state": state,
+        "mandi": mandi,
+        "variety": variety
+    })
+    
+    price_data = {
+        "state": state,
+        "mandi": mandi,
+        "variety": variety,
+        "price": price,
+        "date": datetime.utcnow().strftime("%d/%m/%Y"),
+        "updated_at": datetime.utcnow()
+    }
+    
+    if existing:
+        await db.mandi_prices.update_one(
+            {"_id": existing["_id"]},
+            {"$set": price_data}
+        )
+        return {"success": True, "message": "Mandi price updated"}
+    else:
+        await db.mandi_prices.insert_one(price_data)
+        return {"success": True, "message": "Mandi price added"}
+
+@api_router.get("/admin/mandi/all")
+async def get_all_mandi_prices():
+    """Get all mandi prices for admin"""
+    prices = await db.mandi_prices.find().sort("updated_at", -1).to_list(100)
+    return {"prices": serialize_doc(prices)}
+
+@api_router.delete("/admin/mandi/{price_id}")
+async def delete_mandi_price(price_id: str):
+    """Delete a mandi price entry"""
+    result = await db.mandi_prices.delete_one({"_id": ObjectId(price_id)})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Price entry not found")
+    return {"success": True, "message": "Mandi price deleted"}
+
+@api_router.get("/admin/transactions/pending")
+async def get_pending_transactions():
+    """Get all pending quality check transactions"""
+    # Find all tenders with pending acceptances
+    tenders = await db.tenders.find({}).to_list(1000)
+    
+    pending_transactions = []
+    for tender in tenders:
+        if tender.get("bids"):
+            for bid in tender["bids"]:
+                if bid.get("status") == "quality_check":
+                    # Get buyer info
+                    buyer = await db.users.find_one({"_id": ObjectId(tender["buyer_id"])})
+                    
+                    pending_transactions.append({
+                        "tender_id": str(tender["_id"]),
+                        "tender_variety": tender["variety"],
+                        "tender_size": tender["size"],
+                        "buyer_name": tender.get("buyer_name"),
+                        "buyer_phone": buyer.get("phone") if buyer else None,
+                        "seller_name": bid["bidder_name"],
+                        "seller_id": bid["bidder_id"],
+                        "quantity": bid.get("quantity_accepted", tender["quantity_mt"]),
+                        "rate": bid["rate_per_kg"],
+                        "delivery_location": tender["delivery_location"],
+                        "accepted_at": bid["bid_time"],
+                        "bid_index": tender["bids"].index(bid)
+                    })
+    
+    return {"pending_transactions": serialize_doc(pending_transactions)}
+
+@api_router.post("/admin/transactions/approve")
+async def approve_transaction(tender_id: str, bid_index: int, approved: bool, notes: str = None):
+    """Approve or reject a transaction"""
+    tender = await db.tenders.find_one({"_id": ObjectId(tender_id)})
+    if not tender:
+        raise HTTPException(status_code=404, detail="Tender not found")
+    
+    if bid_index >= len(tender.get("bids", [])):
+        raise HTTPException(status_code=400, detail="Invalid bid index")
+    
+    bid = tender["bids"][bid_index]
+    
+    # Update the specific bid's status
+    new_status = "approved" if approved else "rejected"
+    update_path = f"bids.{bid_index}.status"
+    notes_path = f"bids.{bid_index}.admin_notes"
+    
+    await db.tenders.update_one(
+        {"_id": ObjectId(tender_id)},
+        {"$set": {
+            update_path: new_status,
+            notes_path: notes
+        }}
+    )
+    
+    # Send push notifications to both buyer and seller about quality check result
+    seller_id = bid.get("bidder_id")
+    buyer_id = tender.get("buyer_id")
+    variety = tender.get("variety", "")
+    quantity = bid.get("quantity_accepted", tender.get("quantity_mt", 0))
+    
+    if approved:
+        # Notify seller
+        await send_notification_to_user(
+            user_id=seller_id,
+            title="Quality Check Approved!",
+            body=f"Your {quantity} MT of {variety} has passed quality check. Trade confirmed!",
+            data={
+                "type": "quality_check_approved",
+                "tender_id": tender_id
+            }
+        )
+        # Notify buyer
+        await send_notification_to_user(
+            user_id=buyer_id,
+            title="Quality Check Approved!",
+            body=f"{quantity} MT of {variety} has passed quality check. Trade confirmed!",
+            data={
+                "type": "quality_check_approved",
+                "tender_id": tender_id
+            }
+        )
+    else:
+        # Notify seller
+        await send_notification_to_user(
+            user_id=seller_id,
+            title="Quality Check Failed",
+            body=f"Your {quantity} MT of {variety} did not pass quality check.{' Reason: ' + notes if notes else ''}",
+            data={
+                "type": "quality_check_rejected",
+                "tender_id": tender_id
+            }
+        )
+        # Notify buyer
+        await send_notification_to_user(
+            user_id=buyer_id,
+            title="Quality Check Failed",
+            body=f"{quantity} MT of {variety} from a seller did not pass quality check.",
+            data={
+                "type": "quality_check_rejected",
+                "tender_id": tender_id
+            }
+        )
+    
+    return {"success": True, "message": f"Transaction {new_status}"}
+
+# ==================== INCLUDE ROUTER ====================
+
+app.include_router(api_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount admin dashboard static files at /api/admin
+app.mount("/api/admin", StaticFiles(directory="/app/admin-dashboard", html=True), name="admin")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    client.close()
