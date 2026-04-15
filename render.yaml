@@ -6,8 +6,8 @@ services:
     startCommand: cd backend && uvicorn server:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHON_VERSION
-        value: 3.10.12
+        value: "3.10.12"
       - key: SUPABASE_URL
         value: https://qnzfadvdxouztyvpbxbc.supabase.co
       - key: SUPABASE_SERVICE_KEY
-        value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFuemZhZHZkeG91enR5dnBieGJjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NjEzODU2OCwiZXhwIjoyMDkxNzE0NTY4fQ.VZVawQnqspj8dXbG3QLZN0RmZ_BDKrYSq4bsd4DHqVQ
+        generateValue: false
